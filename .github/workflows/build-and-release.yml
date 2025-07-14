@@ -1,0 +1,139 @@
+name: Build and Release
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - '**/*.csproj'
+
+jobs:
+  detect-version:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.extract-version.outputs.version }}
+      should_release: ${{ steps.check-release.outputs.should_release }}
+      prerelease: ${{ steps.check-release.outputs.prerelease }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Extract project version
+        id: extract-version
+        run: |
+          VERSION=$(grep -oPm1 '(?<=<Version>)[^<]+' FanControlThermaltake/FanControl.Thermaltake.csproj || echo "")
+          echo "version=$VERSION" >> $GITHUB_OUTPUT
+
+      - name: Check if release needed
+        id: check-release
+        run: |
+          # Check if version tag already exists
+          if git ls-remote --tags origin | grep -q "refs/tags/v${{ steps.extract-version.outputs.version }}$"; then
+            echo "should_release=false" >> $GITHUB_OUTPUT
+          else
+            echo "should_release=true" >> $GITHUB_OUTPUT
+          fi
+
+          # Check if version is prerelease
+          if echo "${{ steps.extract-version.outputs.version }}" | grep -Eiq '(rc|beta|alpha)'; then
+            echo "prerelease=true" >> $GITHUB_OUTPUT
+          else
+            echo "prerelease=false" >> $GITHUB_OUTPUT
+          fi
+
+  build-net48:
+    needs: detect-version
+    runs-on: windows-2022
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup MSBuild
+        uses: microsoft/setup-msbuild@v2
+
+      - name: Setup NuGet
+        uses: NuGet/setup-nuget@v1
+
+      - name: Restore packages
+        run: nuget restore FanControlThermaltake.sln
+
+      - name: Build (.NET 4.8)
+        run: msbuild FanControlThermaltake.sln /p:Configuration=Release /p:TargetFramework=net48
+
+      - name: Package artifacts
+        shell: bash
+        run: |
+          mkdir -p artifacts
+          7z a artifacts/FanControlThermaltake-net48-v${{ needs.detect-version.outputs.version }}.zip ./FanControlThermaltake/bin/Release/net48/FanControl.Thermaltake.dll
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: FanControlThermaltake-net48-v${{ needs.detect-version.outputs.version }}
+          path: artifacts/*.zip
+
+  build-net8:
+    needs: detect-version
+    runs-on: windows-2022
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup .NET 8
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '8.0.x'
+
+      - name: Restore packages
+        run: dotnet restore -p:TargetFramework=net8.0 FanControlThermaltake.sln
+
+      - name: Build (.NET 8)
+        run: dotnet build FanControlThermaltake.sln --configuration Release --framework net8.0 --no-restore
+
+      - name: Package artifacts
+        shell: bash
+        run: |
+          mkdir -p artifacts
+          7z a artifacts/FanControlThermaltake-net8-v${{ needs.detect-version.outputs.version }}.zip ./FanControlThermaltake/bin/Release/net8.0/FanControl.Thermaltake.dll
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: FanControlThermaltake-net8-v${{ needs.detect-version.outputs.version }}
+          path: artifacts/*.zip
+
+  release:
+    needs: [detect-version, build-net48, build-net8]
+    if: needs.detect-version.outputs.should_release == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: release-artifacts
+
+      - name: Create Git tag
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git tag v${{ needs.detect-version.outputs.version }}
+          git push origin v${{ needs.detect-version.outputs.version }}
+
+      - name: Create GitHub Release
+        uses: ncipollo/release-action@v1
+        with:
+          tag: v${{ needs.detect-version.outputs.version }}
+          name: Release v${{ needs.detect-version.outputs.version }}
+          body: |
+            ## FanControl Thermaltake Plugin v${{ needs.detect-version.outputs.version }}
+            
+            Multi-target build supporting both .NET Framework 4.8 and .NET 8.0
+            
+            **Downloads:**
+            - `FanControlThermaltake-net48-v${{ needs.detect-version.outputs.version }}.zip` - For .NET Framework 4.8
+            - `FanControlThermaltake-net8-v${{ needs.detect-version.outputs.version }}.zip` - For .NET 8.0
+          artifacts: "release-artifacts/**/*.zip"
+          prerelease: ${{ needs.detect-version.outputs.prerelease }}
